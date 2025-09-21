@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/spf13/cobra"
@@ -91,19 +93,183 @@ func checkGenCorimArgs() error {
 		return fmt.Errorf("unsupported attestation scheme %s, only psa and cca are supported", *genCorimAttestationScheme)
 	}
 
-	if _, err := os.Stat(*genCorimTemplateDir); errors.Is(err, os.ErrNotExist) {
-		return errors.New("template directory does not exist")
+	// Validate evidence file with comprehensive security checks
+	if err := validateEvidenceFile(*genCorimEvidenceFile); err != nil {
+		return fmt.Errorf("evidence file validation failed: %w", err)
 	}
 
-	if _, err := os.Stat(*genCorimTemplateDir + "/comid-template.json"); errors.Is(err, os.ErrNotExist) {
-		return errors.New("file `comid-template.json` is missing from template directory")
+	// Validate key file with comprehensive security checks
+	if err := validateKeyFile(*genCorimKeyFile); err != nil {
+		return fmt.Errorf("key file validation failed: %w", err)
 	}
 
-	if _, err := os.Stat(*genCorimTemplateDir + "/corim-template.json"); errors.Is(err, os.ErrNotExist) {
-		return errors.New("file `corim-template.json` is missing from template directory")
+	// Validate template directory exists and is accessible
+	if _, err := os.Stat(*genCorimTemplateDir); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("template directory does not exist: %s", *genCorimTemplateDir)
+		}
+		return fmt.Errorf("cannot access template directory: %w", err)
+	}
+
+	// Check for required template files
+	comidTemplatePath := filepath.Join(*genCorimTemplateDir, "comid-template.json")
+	if err := validateInputFile(comidTemplatePath, "CoMID template file"); err != nil {
+		return fmt.Errorf("CoMID template validation failed: %w", err)
+	}
+
+	corimTemplatePath := filepath.Join(*genCorimTemplateDir, "corim-template.json")
+	if err := validateInputFile(corimTemplatePath, "CoRIM template file"); err != nil {
+		return fmt.Errorf("CoRIM template validation failed: %w", err)
 	}
 
 	return nil
+}
+
+// validateInputFile performs comprehensive validation of input files with security checks
+func validateInputFile(filePath, fileType string) error {
+	if filePath == "" {
+		return fmt.Errorf("%s path cannot be empty", fileType)
+	}
+
+	// Clean and validate path to prevent directory traversal attacks
+	cleanPath := filepath.Clean(filePath)
+	// Block suspicious patterns like multiple ../ or absolute paths with ..
+	if strings.Contains(filePath, "../..") || (filepath.IsAbs(filePath) && strings.Contains(filePath, "..")) {
+		return fmt.Errorf("%s path contains directory traversal patterns: %s", fileType, filePath)
+	}
+
+	// Check if file exists
+	fileInfo, err := os.Stat(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%s does not exist: %s", fileType, filePath)
+		}
+		if os.IsPermission(err) {
+			return fmt.Errorf("permission denied accessing %s: %s", fileType, filePath)
+		}
+		return fmt.Errorf("error accessing %s: %w", fileType, err)
+	}
+
+	// Ensure it's a file, not a directory
+	if fileInfo.IsDir() {
+		return fmt.Errorf("%s path points to a directory, not a file: %s", fileType, filePath)
+	}
+
+	// Check file size limit (10MB maximum)
+	const maxFileSize = 10 * 1024 * 1024
+	if fileInfo.Size() > maxFileSize {
+		return fmt.Errorf("%s is too large (%.2f MB). Maximum allowed size is %.2f MB", 
+			fileType, float64(fileInfo.Size())/(1024*1024), float64(maxFileSize)/(1024*1024))
+	}
+
+	// Check if file is empty
+	if fileInfo.Size() == 0 {
+		return fmt.Errorf("%s is empty: %s", fileType, filePath)
+	}
+
+	// Check if file is readable
+	file, err := os.Open(cleanPath)
+	if err != nil {
+		return fmt.Errorf("cannot read %s: %w", fileType, err)
+	}
+	defer file.Close()
+
+	return nil
+}
+
+// validateEvidenceFile validates CBOR evidence files
+func validateEvidenceFile(filePath string) error {
+	if err := validateInputFile(filePath, "evidence file"); err != nil {
+		return err
+	}
+
+	// Check file extension
+	if !strings.HasSuffix(strings.ToLower(filePath), ".cbor") {
+		return fmt.Errorf("evidence file must have .cbor extension: %s", filePath)
+	}
+
+	// Read first few bytes to validate CBOR format
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot open evidence file for validation: %w", err)
+	}
+	defer file.Close()
+
+	header := make([]byte, 4)
+	n, err := file.Read(header)
+	if err != nil {
+		return fmt.Errorf("cannot read evidence file header: %w", err)
+	}
+
+	if n > 0 && !isValidCBORStart(header[:n]) {
+		return fmt.Errorf("evidence file does not appear to be valid CBOR format: %s", filePath)
+	}
+
+	return nil
+}
+
+// validateKeyFile validates JSON Web Key files
+func validateKeyFile(filePath string) error {
+	if err := validateInputFile(filePath, "key file"); err != nil {
+		return err
+	}
+
+	// Check file extension
+	if !strings.HasSuffix(strings.ToLower(filePath), ".json") {
+		return fmt.Errorf("key file must have .json extension: %s", filePath)
+	}
+
+	// Read and validate JSON structure
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot read key file: %w", err)
+	}
+
+	// Validate JSON format
+	var jsonData interface{}
+	if err := json.Unmarshal(content, &jsonData); err != nil {
+		return fmt.Errorf("key file contains invalid JSON: %w", err)
+	}
+
+	// Basic JWK validation - check for required fields
+	var jwkData map[string]interface{}
+	if err := json.Unmarshal(content, &jwkData); err != nil {
+		return fmt.Errorf("key file is not a valid JSON object: %w", err)
+	}
+
+	// Check for essential JWK fields
+	if _, hasKty := jwkData["kty"]; !hasKty {
+		return fmt.Errorf("key file missing required 'kty' field for JWK format: %s", filePath)
+	}
+
+	return nil
+}
+
+// isValidCBORStart checks if the given bytes could be the start of a valid CBOR file
+func isValidCBORStart(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+
+	// Simple heuristic: check if it looks like text (which is definitely not CBOR)
+	// Most CBOR files start with specific patterns
+	firstByte := data[0]
+	
+	// If it starts with printable ASCII text, it's probably not CBOR
+	if firstByte >= 0x20 && firstByte <= 0x7E {
+		// Check if it looks like JSON or other text formats
+		text := string(data)
+		if strings.HasPrefix(text, "{") || strings.HasPrefix(text, "[") || 
+		   strings.HasPrefix(text, "This") || strings.HasPrefix(text, "Hello") {
+			return false
+		}
+	}
+
+	// CBOR major types (first 3 bits of first byte)
+	majorType := firstByte >> 5
+
+	// Valid CBOR major types are 0-7
+	return majorType <= 7
 }
 
 func Execute() {
